@@ -13,7 +13,6 @@ DEB="${PKG}_${VER}.deb"
 
 green() { printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
 red()   { printf "\033[1;31m[!]\033[0m %s\n" "$*" >&2; }
-
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { red "Missing command: $1"; exit 1; }; }
 
 # 0) Sanity
@@ -41,7 +40,7 @@ Maintainer: NaturalOS Team <contato@naturalos.org>
 Depends: python3, python3-psutil
 Description: Console-based system monitor with ASCII graphics
  ${PKG} is a lightweight, console-based system monitor that displays CPU, memory,
- and disk I/O usage using ASCII graphics in real time. It is written in Python
+ swap, and disk I/O using ASCII graphics in real time. It is written in Python
  and uses psutil for metrics.
 EOF
 
@@ -62,10 +61,10 @@ exit 0
 EOF
 chmod 0755 "${DEBDIR}/prerm"
 
-green "Writing /usr/lib/${PKG}/${PKG}.py (colored UI, better graphs)…"
+green "Writing /usr/lib/${PKG}/${PKG}.py (colors + better graphs + SWAP)…"
 cat > "${LIBDIR}/${PKG}.py" <<'PYCODE'
 #!/usr/bin/env python3
-# ghtop - console graphics for CPU/MEM/DISK I/O
+# ghtop - console graphics for CPU/MEM/SWAP/DISK I/O
 # Theme: black + "orange" (yellow) + baby blue (cyan)
 import curses, time, argparse
 from collections import deque, defaultdict
@@ -73,7 +72,7 @@ import psutil
 
 # ====== Config ======
 DEFAULT_REFRESH = 1.0    # seconds
-HIST_LEN = 60            # sparkline points (rightmost = most recent)
+HIST_LEN = 60            # sparkline points
 BAR_CHAR = "█"
 SPARK_CHARS = "▁▂▃▄▅▆▇█"  # 8 levels
 PANEL_SPACING = 1
@@ -159,8 +158,8 @@ def init_colors():
     mk("title", FG["orange"], -1)
     mk("cpu",   FG["babyblue"], -1)
     mk("mem",   FG["orange"], -1)
+    mk("swap",  FG["babyblue"], -1)  # swap em azul-bebê para diferenciar de RAM
     mk("io",    FG["blue"], -1)
-    mk("muted", FG["white"], -1)
     return pairs
 
 # ====== main loop ======
@@ -177,6 +176,7 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
     c_title = colors.get("title", curses.A_BOLD)
     c_cpu   = colors.get("cpu", curses.A_BOLD)
     c_mem   = colors.get("mem", curses.A_BOLD)
+    c_swap  = colors.get("swap", curses.A_BOLD)
     c_io    = colors.get("io", curses.A_BOLD)
 
     show_disks = start_perdisk
@@ -185,17 +185,23 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
     cpu_hist_total = deque(maxlen=HIST_LEN)
     cpu_hist_cores = defaultdict(lambda: deque(maxlen=HIST_LEN))
     mem_hist = deque(maxlen=HIST_LEN)
+    swap_hist = deque(maxlen=HIST_LEN)
     io_hist_r = deque(maxlen=HIST_LEN)
     io_hist_w = deque(maxlen=HIST_LEN)
+    swap_in_hist = deque(maxlen=HIST_LEN)
+    swap_out_hist = deque(maxlen=HIST_LEN)
 
-    # baseline I/O
+    # baselines
     last_disk = psutil.disk_io_counters()
     last_time = time.time()
+    swap0 = psutil.swap_memory()
+    last_swap_sin, last_swap_sout = swap0.sin, swap0.sout
     started_at = time.time()
 
-    # dynamic IO scale (EMA of peak)
-    io_scale = 10 * 1024 * 1024  # start ~10 MiB/s
-    ema_alpha = 0.2              # smoothing
+    # dynamic scales (EMA)
+    io_scale = 10 * 1024 * 1024    # ~10 MiB/s
+    swap_scale = 1 * 1024 * 1024   # ~1 MiB/s
+    ema_alpha = 0.2
 
     while True:
         stdscr.erase()
@@ -203,7 +209,7 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
         inner_w = max(20, w - 36)
 
         # Title
-        title = " ghtop — CPU • Memory • Disk I/O  (q: quit  +/-: refresh  d: per-disk) "
+        title = " ghtop — CPU • Memory • Swap • Disk I/O  (q: quit  +/-: refresh  d: per-disk) "
         addstr_safe(stdscr, 0, 0, title, c_title | curses.A_BOLD)
 
         # CPU
@@ -234,12 +240,12 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
             s = spark(cpu_hist_cores[i])
             addstr_safe(stdscr, yy, x+len(line)+min(inner_w, colw-22)+3, s[-12:], c_cpu)
             col_i += 1
-            if yy >= h - 10:
+            if yy >= h - 12:
                 break
         y = y + (max(1, (col_i + cols - 1) // cols)) + PANEL_SPACING
 
-        # Memory
-        addstr_safe(stdscr, y, 0, "Memory", c_title | curses.A_BOLD); y += 1
+        # Memory (RAM)
+        addstr_safe(stdscr, y, 0, "Memory (RAM)", c_title | curses.A_BOLD); y += 1
         vm = psutil.virtual_memory()
         mem_pct = vm.percent
         mem_hist.append(mem_pct)
@@ -247,6 +253,41 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
         addstr_safe(stdscr, y, 0, lbl, c_text)
         draw_bar(stdscr, y, len(lbl), mem_pct, inner_w, c_mem)
         addstr_safe(stdscr, y, len(lbl)+inner_w+3, spark(mem_hist), c_mem); y += 1
+
+        # Swap (usage + in/out per second)
+        addstr_safe(stdscr, y, 0, "Swap", c_title | curses.A_BOLD); y += 1
+        sw = psutil.swap_memory()
+        swap_pct = sw.percent
+        swap_hist.append(swap_pct)
+        lbl = f"Used {swap_pct:5.1f}%  {human(sw.used)}/{human(sw.total)} "
+        addstr_safe(stdscr, y, 0, lbl, c_text)
+        draw_bar(stdscr, y, len(lbl), swap_pct, inner_w, c_swap)
+        addstr_safe(stdscr, y, len(lbl)+inner_w+3, spark(swap_hist), c_swap); y += 1
+
+        # compute swap rates
+        now_time = time.time()
+        dt = max(1e-6, now_time - last_time)
+        sin_ps = max(0.0, (sw.sin - last_swap_sin) / dt)
+        sout_ps = max(0.0, (sw.sout - last_swap_sout) / dt)
+        last_swap_sin, last_swap_sout = sw.sin, sw.sout
+        swap_in_hist.append(sin_ps); swap_out_hist.append(sout_ps)
+
+        # scale (EMA) for swap in/out
+        recent_swap_peak = max(max(swap_in_hist) if swap_in_hist else 1, max(swap_out_hist) if swap_out_hist else 1, 1)
+        target_swap_scale = max(recent_swap_peak, 256*1024)  # >= 256 KiB/s
+        swap_scale = (1-ema_alpha)*swap_scale + ema_alpha*target_swap_scale
+
+        def spct(bps): return clamp((bps / max(1.0, swap_scale)) * 100.0, 0.0, 100.0)
+
+        lbl = f"Swap-in  {human(sin_ps)}/s "
+        addstr_safe(stdscr, y, 0, lbl, c_text)
+        draw_bar(stdscr, y, len(lbl), spct(sin_ps), inner_w, c_swap)
+        addstr_safe(stdscr, y, len(lbl)+inner_w+3, spark(swap_in_hist), c_swap); y += 1
+
+        lbl = f"Swap-out {human(sout_ps)}/s "
+        addstr_safe(stdscr, y, 0, lbl, c_text)
+        draw_bar(stdscr, y, len(lbl), spct(sout_ps), inner_w, c_swap)
+        addstr_safe(stdscr, y, len(lbl)+inner_w+3, spark(swap_out_hist), c_swap); y += 1
 
         # Disk FS usage (/)
         try:
@@ -260,20 +301,17 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
 
         # Disk I/O with dynamic scale
         now_disk = psutil.disk_io_counters()
-        now_time = time.time()
-        dt = max(1e-6, now_time - last_time)
+        # dt já calculado acima
         rps = (now_disk.read_bytes - last_disk.read_bytes)/dt
         wps = (now_disk.write_bytes - last_disk.write_bytes)/dt
         last_disk = now_disk; last_time = now_time
 
         io_hist_r.append(rps); io_hist_w.append(wps)
         recent_peak = max(max(io_hist_r) if io_hist_r else 1, max(io_hist_w) if io_hist_w else 1, 1)
-        # EMA toward recent peak, never below 1 MiB/s
-        target_scale = max(recent_peak, 1*1024*1024)
+        target_scale = max(recent_peak, 1*1024*1024)  # >= 1 MiB/s
         io_scale = (1-ema_alpha)*io_scale + ema_alpha*target_scale
 
-        def io_pct(bps): 
-            return clamp((bps / max(1.0, io_scale)) * 100.0, 0.0, 100.0)
+        def io_pct(bps): return clamp((bps / max(1.0, io_scale)) * 100.0, 0.0, 100.0)
 
         lbl = f"I/O Read  {human(rps)}/s "
         addstr_safe(stdscr, y, 0, lbl, c_text)
@@ -299,7 +337,11 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
                 pass
 
         # Footer
-        footer = f"Refresh: {refresh:.2f}s   Term: {w}x{h}   Scale(IO): ~{human(io_scale)}/s at 100%"
+        footer = (
+            f"Refresh: {refresh:.2f}s   Term: {w}x{h}   "
+            f"Scale(IO): ~{human(io_scale)}/s @100%   "
+            f"Scale(SWAP): ~{human(swap_scale)}/s @100%"
+        )
         addstr_safe(stdscr, h-1, 0, footer, c_title)
 
         stdscr.refresh()
@@ -327,7 +369,7 @@ def run(stdscr, refresh: float, duration: float, start_perdisk: bool):
             return
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="ghtop - console graphics for CPU/MEM/DISK I/O")
+    ap = argparse.ArgumentParser(description="ghtop - console graphics for CPU/MEM/SWAP/DISK I/O")
     ap.add_argument("--interval", "-i", type=float, default=DEFAULT_REFRESH, help="refresh interval in seconds (default: 1.0)")
     ap.add_argument("--duration", "-t", type=float, default=0.0, help="run time in seconds (0 = infinite)")
     ap.add_argument("--per-disk", action="store_true", help="start with per-disk panel visible")
@@ -349,9 +391,10 @@ PYCODE
 chmod 0644 "${LIBDIR}/${PKG}.py"
 
 green "Writing /usr/bin/${PKG} wrapper…"
-cat > "${BINDIR}/${PKG}" <<EOF
-#!/bin/sh
-exec python3 /usr/lib/${PKG}/${PKG}.py "\$@"
+cat > "${BINDIR}/${PKG}" <<'EOF'
+#!/usr/bin/env bash
+# wrapper global robusto: usa /usr/bin/env python3
+exec /usr/bin/env python3 /usr/lib/ghtop/ghtop.py "$@"
 EOF
 chmod 0755 "${BINDIR}/${PKG}"
 
